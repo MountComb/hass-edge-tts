@@ -105,6 +105,27 @@ class EdgeTTSEntity(TextToSpeechEntity):
     def _process_tts_audio(
         self, message: str, language: str, options: dict[str, Any]
     ) -> bytes | None:
+        tts = self._create_communicate(message, language, options)
+        mp3 = b''
+        start_time = time.perf_counter()
+        try:
+            for chunk in tts.stream_sync():
+                if chunk["type"] == "audio":
+                    mp3 += chunk["data"]
+                else:
+                    _LOGGER.debug("Edge TTS metadata: %s", chunk)
+        except edge_tts.exceptions.NoAudioReceived as exc:
+            _LOGGER.warning("No audio received for text: %s", message)
+            raise HomeAssistantError(f"{self.name}: No audio received: {message}") from exc
+        end_time = time.perf_counter()
+        elapsed_time = (end_time - start_time) * 1000
+        _LOGGER.debug("load tts elapsed_time: %sms", elapsed_time)
+        return mp3
+
+    def _create_communicate(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> edge_tts.Communicate:
+        """Create an Edge TTS communication with the requested options."""
         opt = {CONF_LANG: language}
         if language in SUPPORTED_VOICES:
             opt[CONF_LANG] = SUPPORTED_VOICES[language]
@@ -124,28 +145,28 @@ class EdgeTTSEntity(TextToSpeechEntity):
                 break
 
         _LOGGER.debug('%s: %s', self.name, [message, opt])
-        mp3 = b''
-        start_time = time.perf_counter()
-        tts = edge_tts.Communicate(
+        return edge_tts.Communicate(
             message,
             voice=voice,
             pitch=opt.get('pitch', '+0Hz'),
             rate=opt.get('rate', '+0%'),
             volume=opt.get('volume', '+0%'),
         )
+
+    async def _stream_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> AsyncGenerator[bytes]:
+        """Stream audio chunks for a text segment as they arrive."""
+        tts = self._create_communicate(message, language, options)
         try:
-            for chunk in tts.stream_sync():
+            async for chunk in tts.stream():
                 if chunk["type"] == "audio":
-                    mp3 += chunk["data"]
+                    yield chunk["data"]
                 else:
                     _LOGGER.debug("Edge TTS metadata: %s", chunk)
         except edge_tts.exceptions.NoAudioReceived as exc:
             _LOGGER.warning("No audio received for text: %s", message)
             raise HomeAssistantError(f"{self.name}: No audio received: {message}") from exc
-        end_time = time.perf_counter()
-        elapsed_time = (end_time - start_time) * 1000
-        _LOGGER.debug("load tts elapsed_time: %sms", elapsed_time)
-        return mp3
 
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
         return TTSAudioResponse("mp3", self._process_tts_stream(request))
@@ -167,6 +188,12 @@ class EdgeTTSEntity(TextToSpeechEntity):
                     continue
                 if char in separators or buffer[-2:] in separators:
                     buffer = ""
-                    yield await self.async_process_tts_audio(msg, request.language, request.options)
+                    async for chunk in self._stream_tts_audio(
+                        msg, request.language, request.options
+                    ):
+                        yield chunk
         if msg := buffer.strip():
-            yield await self.async_process_tts_audio(msg, request.language, request.options)
+            async for chunk in self._stream_tts_audio(
+                msg, request.language, request.options
+            ):
+                yield chunk
